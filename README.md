@@ -1,204 +1,65 @@
-# 🔧 ESP32 — Firmware de Seguridad para Cocinas Industriales
+# ESP32 — Firmware de seguridad para cocinas industriales
 
-<div align="center">
+Firmware del nodo físico (ESP32 DevKit, Arduino core ESP32 **3.x**, por `analogWrite()`). Lee 4 sensores, aplica una
+lógica de prioridades P0–P8 (Normal = 9), actúa de forma autónoma sobre 3 ventiladores, válvula, aspersor y buzzer,
+muestra el estado en un LCD 16×2 I2C y publica JSON por MQTT. **La protección local no depende de la red.**
 
-![Plataforma](https://img.shields.io/badge/plataforma-Arduino%20Uno%20%2F%20ESP32-00979D?style=flat-square)
-![Lenguaje](https://img.shields.io/badge/lenguaje-C%2B%2B%20Arduino-blue?style=flat-square)
-![Simulación](https://img.shields.io/badge/simulación-Wokwi-orange?style=flat-square)
-![Estado](https://img.shields.io/badge/estado-funcional-brightgreen?style=flat-square)
+> Estado de validación: lógica probada en PC con stubs (`test_host/`); **no compilado con el toolchain real del ESP32 ni
+> probado en hardware** (ver "Pendientes").
 
-Firmware del nodo físico del sistema IoT de monitoreo de seguridad.<br>
-Parte del proyecto de grado — Universidad Industrial de Santander (UIS).
+## Librerías
+`LiquidCrystal_I2C`, `PubSubClient`, `ArduinoJson` (v6, `StaticJsonDocument`), `WiFi` (incluida en el core ESP32).
+Antes de cargar edite en el `.ino`: `WIFI_SSID`, `WIFI_PASSWORD`, `MQTT_BROKER`, `MQTT_TOPIC`, `MQTT_CLIENT_ID`.
+El `.ino` debe estar en una carpeta con su mismo nombre para el Arduino IDE.
 
-[Organización](https://github.com/cocinas-industriales-uis) ·
-[Servidor](https://github.com/cocinas-industriales-uis/servidor) ·
-[Página web](https://github.com/cocinas-industriales-uis/pagina-web)
-
-</div>
-
----
-
-## ¿Qué hace este firmware?
-
-Lee tres sensores en tiempo real, aplica una lógica de prioridades de
-seguridad y actúa sobre tres ventiladores, una válvula, aspersores y
-un buzzer de forma autónoma. Además muestra el estado del sistema en
-un LCD 16×2 y envía los datos al servidor Django cada 5 segundos.
-
----
-
-## Hardware requerido
-
-| Componente | Cantidad | Pin(es) |
-|---|:---:|---|
-| Arduino Uno | 1 | — |
-| Sensor NTC temperatura | 1 | A0 |
-| Sensor gas GLP (MQ-6) | 1 | A1 |
-| Sensor presión | 1 | A2 |
-| Sensor PIR movimiento | 1 | A3 |
-| Driver L293D | 2 | — |
-| Motor DC (ventiladores) | 3 | PWM: 3, 5, 6 |
-| LED rojo — válvula | 1 | 4 |
-| LED azul — aspersor | 1 | 2 |
-| Buzzer | 1 | 7 |
-| LCD 16×2 I2C | 1 | A4 (SDA), A5 (SCL) |
-| Resistencias 220Ω | 2 | — |
-
-> El diagrama completo del circuito está en `wokwi_diagram.json`.
-> Ábrelo en [wokwi.com](https://wokwi.com) para simular sin hardware físico.
-
----
-
-## Lógica de prioridades
-
-El sistema toma decisiones en cascada. Una prioridad superior bloquea
-completamente a las inferiores.
-
-```
-P1 — Gas ≥ 73%          EMERGENCIA TOTAL
-     Vent1=100% Vent2=100% Vent3=100%
-     Válvula=CERRADA  Buzzer=rápido (150ms)
-     → Explosión de gas: riesgo más inmediato e irreversible
-
-P2b — Temp > 90°C       INCENDIO SEVERO
-     Vent1=OFF Vent2=OFF Vent3=OFF
-     Aspersor=ON  Válvula=CERRADA  Buzzer=rápido
-     → Flujo de aire propaga llamas; se corta todo
-
-P2a — Temp 70–90°C      INCENDIO MODERADO
-     Vent1=OFF  Vent2=100%  Vent3=OFF
-     Aspersor=ON  Válvula=CERRADA  Buzzer=lento (250ms)
-     → Se corta inyección, solo extracción para evacuar humo
-
-P3 — Presión ≥ 68%      PRESIÓN ALTA
-     Vent2 += refuerzo proporcional
-     → Presión alta es peligrosa para llamas y fugas de gas
-
-P4 — Temp 20–60°C       OPERACIÓN NORMAL
-     Vent1 = PWM proporcional (80–255)
-     Vent2 = Vent1 + ajuste de presión
-     → Control suave sin alarma activa
-```
-
----
-
-## Mapa de pines
-
-```
-A0  → NTC temperatura        (0 raw = -55°C, 1023 raw = 155°C)
-A1  → Sensor gas GLP
-A2  → Sensor presión
-A3  → PIR movimiento
-
- 2  → LED aspersor (azul)
- 3  → Vent1 inyección    (PWM)
- 4  → LED válvula (rojo)
- 5  → Vent2 extracción   (PWM)
- 6  → Vent3 emergencia   (PWM)
- 7  → Buzzer
-
-A4  → LCD SDA (I2C)
-A5  → LCD SCL (I2C)
-
-Pines 8–13 reservados para drivers A4988 de steppers
-```
-
----
-
-## Umbrales configurables
-
-Todos los umbrales están definidos como `#define` al inicio del archivo
-`sceht.ino` para facilitar su ajuste:
-
-```cpp
-#define TEMP_INICIO_VENT   20.0   // °C — arranca ventilación
-#define TEMP_MAX_VENT      60.0   // °C — velocidad máxima
-#define TEMP_INCENDIO      70.0   // °C — activa aspersores
-
-#define GAS_ALERTA         500    // raw (0–1023) — acelera vents
-#define GAS_PELIGRO        750    // raw — emergencia total (~73%)
-
-#define PRES_ALTA          700    // raw — refuerza extracción (~68%)
-```
-
----
-
-## LCD — mensajes en pantalla
-
-El display alterna entre dos vistas cada 2 segundos en operación normal,
-y cambia a mensajes de emergencia cuando se activa una prioridad:
-
-| Estado | Línea 1 | Línea 2 |
+## Pines (ESP32)
+| Función | Pin | Notas |
 |---|---|---|
-| Normal (vista 1) | `T:25C G:10%` | `V1:45% V2:45%` |
-| Normal (vista 2) | `Pres:30%` | `V3:0%` |
-| Gas alerta | `Pres:30%` | `V3:0% G-ALRT` |
-| Incendio moderado | `!!INCENDIO!!` | `T:75C V2:100%` |
-| Incendio severo | `!!INCENDIO SEV!!` | `T:95C ASP:ON` |
-| Fuga de gas | `!!FUGA DE GAS!!` | `G:80% VLV:OFF` |
+| NTC temperatura | GPIO34 | ADC1, solo entrada |
+| Gas MQ-2 | GPIO35 | ADC1, solo entrada |
+| Presión (potenciómetro) | GPIO32 | ADC1 |
+| Llama KY-026 | GPIO14 | `INPUT_PULLUP`, LOW = llama |
+| Vent1 inyección / Vent2 extracción / Vent3 emergencia | GPIO25 / 26 / 27 | PWM |
+| LED aspersor / LED válvula | GPIO18 / 19 | |
+| Buzzer | **GPIO23** | antes GPIO21, que es SDA del LCD (corregido; si ya cableó el buzzer a 21, muévalo) |
+| LCD I2C 0x27 | SDA 21 / SCL 22 | |
 
----
+## Lógica de prioridades (la del código)
+| P | Condición | Respuesta | Confirmación |
+|---|---|---|---|
+| 0 | llama + gas ≥ 1640 | vent 0/0/0, válvula cerrada, aspersor ON | inmediata |
+| 1 | gas ≥ 1640 (~20 % LEL), sin llama | vent 255/255/255, válvula cerrada | inmediata |
+| 2 | llama + T > 90 °C | vent 0, aspersor ON, válvula cerrada | inmediata |
+| 3 | llama + (T ≥ 60 °C o ΔT ≥ 2 °C/s) | solo extracción, aspersor, válvula | ΔT alto: inmediata; por T: 10 s |
+| 4 | gas 800–1640 (~10–20 % LEL) | ventilación 80–200 | inmediata |
+| 5 | presión ≥ 2786 y gas ≥ 800 | extracción máxima | inmediata |
+| 6 | presión ≥ 2786 | diferencial (V2 > V1) | inmediata |
+| 7 | T > 20 °C | PWM proporcional 80–255 | inmediata |
+| 8 | solo llama | monitoreo sin alarma | 10 s |
+| 9 | resto | normal | — |
 
-## Simulación en Wokwi
+Mientras P3/P8 por temperatura se confirman, los actuadores siguen en "normal" pero el **MQTT ya publica la prioridad
+detectada** con `confirmando=true`. Umbrales gas/presión en cuentas ADC de 12 bits (0–4095), por calibrar con gas real.
 
-No necesitas hardware físico para probar el firmware.
+## Payload MQTT (`cocinas/cocina_01`)
+`temperatura, gas_raw, gas_pct, presion_raw, presion_pct, llama, delta_t, prioridad, v1_pct, v2_pct, v3_pct, valvula,
+aspersor, confirmando, sensor_ok, ts`. `valvula=true` significa válvula **cerrada**. `sensor_ok=false` indica NTC fuera
+de rango: `temperatura` vale 0 y no es una medida. Cadencia: P0–P3 cada 0,5 s (y envío inmediato al escalar), P4–P5 cada
+1 s, resto cada 5 s.
 
-1. Ve a [wokwi.com](https://wokwi.com) y crea un nuevo proyecto Arduino
-2. Copia el contenido de `sceht.ino` en el editor
-3. Importa `wokwi_diagram.json` desde el menú de diagrama
-4. Presiona ▶ para simular
+## Comportamiento sin red
+WiFi se inicia sin bloquear; se reintenta cada 10 s. MQTT: un intento cada 10 s. El loop de control corre cada ~50 ms.
 
-Mueve los potenciómetros de Gas y Presión, y el sensor NTC de temperatura
-para ver cómo reacciona el sistema en cada escenario.
-
----
-
-## Nota sobre la conversión de temperatura en Wokwi
-
-El sensor `wokwi-ntc-temperature-sensor` en Wokwi no simula la resistencia
-real del NTC — entrega un valor analógico ya mapeado. Por eso el firmware
-usa mapeo lineal en lugar de la fórmula Steinhart-Hart:
-
-```cpp
-// Wokwi NTC: 0 raw = -55°C, 1023 raw = 155°C
-float leerTemperatura() {
-  int raw = analogRead(PIN_TEMP);
-  return map(raw, 0, 1023, -55, 155);
-}
+## Pruebas en PC
+```bash
+cd test_host && ./run.sh        # compila el .ino real contra stubs de la API Arduino y ejecuta 18 escenarios
 ```
+Los stubs no modelan el ADC real, el PWM ni los tiempos de WiFi/TCP; los escenarios marcados `ABIERTO` son pendientes.
 
-En el prototipo físico real con ESP32 y sensor NTC real, esta función
-deberá reemplazarse por la fórmula Steinhart-Hart con los coeficientes
-del sensor específico.
-
----
-
-## Archivos
-
-| Archivo | Descripción |
-|---|---|
-| `sceht.ino` | Firmware principal — lógica completa del sistema |
-| `wokwi_diagram.json` | Diagrama del circuito para simulación en Wokwi |
-
----
-
-## Parte del sistema completo
-
-```
-[ESP32 / Arduino Uno]  →  HTTP POST cada 5s  →  [Django Backend]
-        ↑                                               ↓
-  sensores físicos                            [React Dashboard]
-  + actuadores                                [App Android]
-```
-
-**Repositorios relacionados:**
-- [servidor](https://github.com/cocinas-industriales-uis/servidor) — Django REST API
-- [pagina-web](https://github.com/cocinas-industriales-uis/pagina-web) — Dashboard React
-- [app-movil](https://github.com/cocinas-industriales-uis/app-movil) — App Android
-- [mqtt](https://github.com/cocinas-industriales-uis/mqtt) — Broker MQTT (pendiente)
-
----
-
-<div align="center">
-  <sub>Proyecto de grado · UIS · 2025–2026 · Cesar Daniel Ávila Barbosa</sub>
-</div>
+## Pendientes conocidos
+1. **Decisión de seguridad:** con llama, T ≥ 60 °C y gas ≥ 800, P3 espera 10 s y la válvula sigue abierta (los vent suben
+   por temperatura). Definir si P3 debe cerrar válvula sin esperar cuando hay gas.
+2. **Falla del NTC con llama:** `temperatura=0` solo permite P8; definir respuesta conservadora.
+3. `mqttClient.connect()` puede bloquear ~3 s por intento con broker caído; evaluar tarea FreeRTOS para la red.
+4. Compilar con el core ESP32 3.x y calibrar NTC (Steinhart-Hart, B=3950), MQ-2 (raw↔%LEL) y ruido de ΔT en hardware.
+5. `wokwi_diagram.json` es de Arduino Uno y no corresponde a este firmware.

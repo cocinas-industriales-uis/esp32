@@ -41,10 +41,9 @@ const char* MQTT_CLIENT_ID = "esp32_cocina_01";
 
 #define LED_ASPERSOR   18   // LED azul — aspersores
 #define LED_VALVULA    19   // LED rojo — válvula gas
-#define BUZZER_PIN     21   // Buzzer activo
+#define BUZZER_PIN     23   // Buzzer activo (NO usar 21/22: son SDA/SCL del LCD I2C)
 
 // LCD I2C en pines por defecto del ESP32: SDA=21, SCL=22
-// OJO: si usas buzzer en pin 21, reasigna buzzer a pin 23
 
 // ================================================================
 // UMBRALES — ajustar tras calibración con gas real
@@ -118,6 +117,19 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 WiFiClient        wifiClient;
 PubSubClient      mqttClient(wifiClient);
 
+// LCD: solo se reescribe una línea cuando cambia su contenido (evita lcd.clear()
+// cada 50 ms, que provocaba parpadeo).
+char lcdBuf[2][17] = {"", ""};
+void lcdLinea(int fila, const char* txt) {
+  char l[17];
+  snprintf(l, sizeof(l), "%-16s", txt);
+  if (strcmp(l, lcdBuf[fila]) != 0) {
+    lcd.setCursor(0, fila);
+    lcd.print(l);
+    strcpy(lcdBuf[fila], l);
+  }
+}
+
 // ================================================================
 // FUNCIONES AUXILIARES
 // ================================================================
@@ -174,34 +186,44 @@ void setPWM(int pin, int valor) {
   analogWrite(pin, constrain(valor, 0, 255));
 }
 
-// Conexión WiFi
+// Reintentos de red: NO bloqueantes. La protección local (sensores → actuadores)
+// debe funcionar aunque no haya WiFi ni broker.
+#define REINTENTO_WIFI_MS   10000
+#define REINTENTO_MQTT_MS   10000
+unsigned long ultimoIntentoWiFi = 0;
+unsigned long ultimoIntentoMQTT = 0;
+bool          primerIntentoMQTT = true;   // el primer intento no espera REINTENTO_MQTT_MS
+
+// Conexión WiFi: solo lanza el intento; el loop() sigue funcionando sin red.
 void conectarWiFi() {
-  Serial.print("Conectando WiFi");
+  Serial.println("Conectando WiFi (en segundo plano)...");
+  WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  int intentos = 0;
-  while (WiFi.status() != WL_CONNECTED && intentos < 30) {
-    delay(500); Serial.print("."); intentos++;
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi OK — IP: " + WiFi.localIP().toString());
-  } else {
-    Serial.println("\nWiFi FALLO — modo offline");
-  }
+  ultimoIntentoWiFi = millis();
 }
 
-// Reconexión MQTT
+// Reintenta WiFi cada REINTENTO_WIFI_MS si está caído
+void mantenerWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (millis() - ultimoIntentoWiFi < REINTENTO_WIFI_MS) return;
+  ultimoIntentoWiFi = millis();
+  Serial.println("WiFi caído — reintentando");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+// Reconexión MQTT: un único intento cada REINTENTO_MQTT_MS, sin delay().
+// OJO: connect() puede bloquear hasta el timeout TCP del cliente WiFi (~3 s por
+// intento) — pendiente validar en hardware / mover red a una tarea FreeRTOS.
 void reconectarMQTT() {
   if (WiFi.status() != WL_CONNECTED) return;
-  int intentos = 0;
-  while (!mqttClient.connected() && intentos < 3) {
-    Serial.print("Conectando MQTT...");
-    if (mqttClient.connect(MQTT_CLIENT_ID)) {
-      Serial.println(" OK");
-    } else {
-      Serial.print(" fallo (rc="); Serial.print(mqttClient.state()); Serial.println(")");
-      delay(500);
-    }
-    intentos++;
+  if (!primerIntentoMQTT && millis() - ultimoIntentoMQTT < REINTENTO_MQTT_MS) return;
+  primerIntentoMQTT = false;
+  ultimoIntentoMQTT = millis();
+  Serial.print("Conectando MQTT...");
+  if (mqttClient.connect(MQTT_CLIENT_ID)) {
+    Serial.println(" OK");
+  } else {
+    Serial.print(" fallo (rc="); Serial.print(mqttClient.state()); Serial.println(")");
   }
 }
 
@@ -216,11 +238,12 @@ unsigned long getIntervalo(int prio) {
 void enviarMQTT(float temp, int gasRaw, int presRaw, bool llama,
                 float deltaT, int prio,
                 int v1, int v2, int v3,
-                bool valvula, bool aspersor, bool confirmando) {
+                bool valvula, bool aspersor, bool confirmando,
+                bool sensorOk) {
 
   if (!mqttClient.connected()) return;
 
-  StaticJsonDocument<320> doc;
+  StaticJsonDocument<352> doc;
   doc["temperatura"]  = round(temp * 10) / 10.0;
   doc["gas_raw"]      = gasRaw;
   doc["gas_pct"]      = map(gasRaw, 0, 4095, 0, 100);
@@ -235,9 +258,10 @@ void enviarMQTT(float temp, int gasRaw, int presRaw, bool llama,
   doc["valvula"]      = valvula;
   doc["aspersor"]     = aspersor;
   doc["confirmando"]  = confirmando;   // true = condición detectada, aún sin confirmar
+  doc["sensor_ok"]    = sensorOk;      // false = NTC fuera de rango; "temperatura" (0) NO es una medida válida
   doc["ts"]           = millis();
 
-  char buffer[320];
+  char buffer[352];
   serializeJson(doc, buffer);
   mqttClient.publish(MQTT_TOPIC, buffer);
 
@@ -273,7 +297,7 @@ void setup() {
 
   // Inicializar historial de temperatura
   float tempInicial = leerTemperatura();
-  if (tempInicial < -900) tempInicial = 25.0f;
+  if (tempInicial < -50.0f || tempInicial > 300.0f) tempInicial = 25.0f;   // lectura inválida
   for (int i = 0; i < HIST_N; i++) tempHistorial[i] = tempInicial;
   ultimaLectura = millis();
 
@@ -283,20 +307,22 @@ void setup() {
   lcd.setCursor(0, 0); lcd.print("SISTEMA COCINA");
   lcd.setCursor(0, 1); lcd.print("Iniciando...");
 
-  // WiFi + MQTT
+  // WiFi + MQTT (no bloqueante: la protección local arranca de inmediato)
   conectarWiFi();
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
   mqttClient.setKeepAlive(30);
 
-  delay(2000);
+  delay(500);   // solo para ver el mensaje de arranque
   lcd.clear();
+  lcdBuf[0][0] = lcdBuf[1][0] = '\0';
 }
 
 // ================================================================
 // LOOP PRINCIPAL
 // ================================================================
 void loop() {
-  // Mantener MQTT vivo
+  // Mantener red (sin bloquear la protección local)
+  mantenerWiFi();
   if (!mqttClient.connected()) reconectarMQTT();
   mqttClient.loop();
 
@@ -308,10 +334,17 @@ void loop() {
   if (llamaRaw) ultimaLlamaTs = millis();
   bool  llama       = llamaRaw ||
                       (ultimaLlamaTs != 0 && (millis() - ultimaLlamaTs) < LLAMA_HOLD_MS);
-  float deltaT      = calcularDeltaT(temperatura);
 
+  // Con el NTC fuera de rango NO se alimenta el historial de ΔT/s (evita un
+  // pico espurio al recuperarse el sensor) y se marca sensor_ok=false en el payload.
   bool sensorError  = (temperatura < -50.0f || temperatura > 300.0f);
-  if (sensorError) temperatura = 0.0f;
+  float deltaT      = 0.0f;
+  if (sensorError) {
+    temperatura   = 0.0f;
+    ultimaLectura = millis();
+  } else {
+    deltaT = calcularDeltaT(temperatura);
+  }
 
   // Flags de condición
   bool gasAlerta    = (gasRaw >= GAS_LEL_LOW);
@@ -451,71 +484,59 @@ void loop() {
   actualizarBuzzer(buzzer, buzzerMs);
 
   // ── 6. LCD ────────────────────────────────────────────────────
-  lcd.clear();
+  char l0[40], l1[40], tTxt[8];
+  int  gasPct  = map(gasRaw, 0, 4095, 0, 100);
+  int  presPct = map(presRaw, 0, 4095, 0, 100);
+  if (sensorError) snprintf(tTxt, sizeof(tTxt), "ERR");
+  else             snprintf(tTxt, sizeof(tTxt), "%dC", (int)temperatura);
   switch (prioActual) {
     case 0:
-      lcd.setCursor(0,0); lcd.print("!!GAS + LLAMA!!");
-      lcd.setCursor(0,1); lcd.print("EVACUAR AHORA!!");
+      snprintf(l0, sizeof(l0), "!!GAS + LLAMA!!");
+      snprintf(l1, sizeof(l1), "EVACUAR AHORA!!");
       break;
     case 1:
-      lcd.setCursor(0,0); lcd.print("!!FUGA DE GAS!!");
-      lcd.setCursor(0,1);
-      lcd.print("G:"); lcd.print(map(gasRaw,0,4095,0,100));
-      lcd.print("% VLV:OFF");
+      snprintf(l0, sizeof(l0), "!!FUGA DE GAS!!");
+      snprintf(l1, sizeof(l1), "G:%d%% VLV:OFF", gasPct);
       break;
     case 2:
-      lcd.setCursor(0,0); lcd.print("!!INCEND.SEV!! ");
-      lcd.setCursor(0,1);
-      lcd.print("T:"); lcd.print((int)temperatura); lcd.print("C ASP:ON");
+      snprintf(l0, sizeof(l0), "!!INCEND.SEV!!");
+      snprintf(l1, sizeof(l1), "T:%s ASP:ON", tTxt);
       break;
     case 3:
-      lcd.setCursor(0,0); lcd.print("!!INCENDIO!!   ");
-      lcd.setCursor(0,1);
-      lcd.print("T:"); lcd.print((int)temperatura); lcd.print("C V2:100%");
+      snprintf(l0, sizeof(l0), "!!INCENDIO!!");
+      snprintf(l1, sizeof(l1), "T:%s V2:100%%", tTxt);
       break;
     case 4:
-      lcd.setCursor(0,0); lcd.print("GAS ALERTA     ");
-      lcd.setCursor(0,1);
-      lcd.print("G:"); lcd.print(map(gasRaw,0,4095,0,100)); lcd.print("% VENT+");
+      snprintf(l0, sizeof(l0), "GAS ALERTA");
+      snprintf(l1, sizeof(l1), "G:%d%% VENT+", gasPct);
       break;
     case 5:
-      lcd.setCursor(0,0); lcd.print("PRES+GAS ALRT  ");
-      lcd.setCursor(0,1);
-      lcd.print("P:"); lcd.print(map(presRaw,0,4095,0,100));
-      lcd.print("% G:"); lcd.print(map(gasRaw,0,4095,0,100)); lcd.print("%");
+      snprintf(l0, sizeof(l0), "PRES+GAS ALRT");
+      snprintf(l1, sizeof(l1), "P:%d%% G:%d%%", presPct, gasPct);
       break;
     case 6:
-      lcd.setCursor(0,0);
-      lcd.print("Pres:"); lcd.print(map(presRaw,0,4095,0,100)); lcd.print("% ALTA  ");
-      lcd.setCursor(0,1);
-      lcd.print("V1:"); lcd.print(map(v1,0,255,0,100));
-      lcd.print("% V2:"); lcd.print(map(v2,0,255,0,100)); lcd.print("%");
+      snprintf(l0, sizeof(l0), "Pres:%d%% ALTA", presPct);
+      snprintf(l1, sizeof(l1), "V1:%d%% V2:%d%%", map(v1,0,255,0,100), map(v2,0,255,0,100));
       break;
     case 8:
-      lcd.setCursor(0,0); lcd.print("Llama detectada");
-      lcd.setCursor(0,1);
-      lcd.print("T:"); lcd.print((int)temperatura); lcd.print("C MONIT.");
+      snprintf(l0, sizeof(l0), "Llama detectada");
+      snprintf(l1, sizeof(l1), "T:%s MONIT.", tTxt);
       break;
     default: {
       // Alterna entre dos vistas cada 2s
       bool vista1 = ((millis() / 2000) % 2 == 0);
       if (vista1) {
-        lcd.setCursor(0,0);
-        lcd.print("T:"); lcd.print((int)temperatura);
-        lcd.print("C G:"); lcd.print(map(gasRaw,0,4095,0,100)); lcd.print("%");
-        lcd.setCursor(0,1);
-        lcd.print("V1:"); lcd.print(map(v1,0,255,0,100));
-        lcd.print("% V2:"); lcd.print(map(v2,0,255,0,100)); lcd.print("%");
+        snprintf(l0, sizeof(l0), "T:%s G:%d%%", tTxt, gasPct);
+        snprintf(l1, sizeof(l1), "V1:%d%% V2:%d%%", map(v1,0,255,0,100), map(v2,0,255,0,100));
       } else {
-        lcd.setCursor(0,0);
-        lcd.print("Pres:"); lcd.print(map(presRaw,0,4095,0,100)); lcd.print("%");
-        lcd.setCursor(0,1);
-        lcd.print("V3:"); lcd.print(map(v3,0,255,0,100)); lcd.print("%");
-        if (llama) lcd.print(" LLAMA");
+        snprintf(l0, sizeof(l0), "Pres:%d%%", presPct);
+        snprintf(l1, sizeof(l1), "V3:%d%%%s", map(v3,0,255,0,100), llama ? " LLAMA" : "");
       }
       break;
     }
   }
+  lcdLinea(0, l0);
+  lcdLinea(1, l1);
 
   // ── 7. ENVÍO MQTT ADAPTATIVO ──────────────────────────────────
   // El intervalo depende de lo que se DETECTA (prioTarget), no de lo confirmado:
@@ -531,7 +552,7 @@ void loop() {
   if (escalada || (ahora - ultimoEnvio >= intervalo)) {
     ultimoEnvio = ahora;
     enviarMQTT(temperatura, gasRaw, presRaw, llama, deltaT, prioEnvio,
-               v1, v2, v3, valvula, aspersor, confirmando);
+               v1, v2, v3, valvula, aspersor, confirmando, !sensorError);
   }
 
   // ── 8. DEBUG SERIAL ───────────────────────────────────────────
