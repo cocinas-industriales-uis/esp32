@@ -358,7 +358,8 @@ void loop() {
   if (llama && gasEmergencia)                         prioTarget = 0;  // P0
   else if (gasEmergencia && !llama)                   prioTarget = 1;  // P1
   else if (llama && temperatura > TEMP_P2_SEV)        prioTarget = 2;  // P2
-  else if (llama && (temperatura >= TEMP_P3_MOD || dtRapido)) prioTarget = 3; // P3
+  // Decisión de diseño: con llama y NTC averiado (temperatura no confiable) se asume P3, sin espera
+  else if (llama && (temperatura >= TEMP_P3_MOD || dtRapido || sensorError)) prioTarget = 3; // P3
   else if (presAlta && gasAlerta)                     prioTarget = 5;  // P5
   else if (gasAlerta && !gasEmergencia)               prioTarget = 4;  // P4
   else if (llama && temperatura < TEMP_P3_MOD && !dtRapido) prioTarget = 8; // P8
@@ -367,9 +368,9 @@ void loop() {
   else                                                prioTarget = 9;  // Normal
 
   // ── 3. TEMPORIZADOR DE CONFIRMACIÓN ───────────────────────────
-  // Sin espera: P0, P1, P2 (llama + >90°C) y P3 con ΔT/s alto.
+  // Sin espera: P0, P1, P2 (llama + >90°C) y P3 con ΔT/s alto o NTC averiado.
   // Con espera de CONFIRM_MS: P3 por temperatura y P8.
-  bool sinEspera  = (prioTarget == 2) || (prioTarget == 3 && dtRapido);
+  bool sinEspera  = (prioTarget == 2) || (prioTarget == 3 && (dtRapido || sensorError));
   bool confirmado = true;
 
   if (!sinEspera && (prioTarget == 3 || prioTarget == 8)) {
@@ -473,6 +474,14 @@ void loop() {
         v2 = v1;
       }
       break;
+  }
+
+  // Decisión de diseño: llama + gas en prealerta (≥ GAS_LEL_LOW) mientras P3 aún se confirma
+  // → válvula cerrada y buzzer YA; aspersor y corte de inyección esperan la confirmación.
+  if (!confirmado && prioTarget == 3 && gasAlerta) {
+    valvula  = true;
+    buzzer   = true;
+    buzzerMs = 250;
   }
 
   // ── 5. APLICAR ACTUADORES ─────────────────────────────────────

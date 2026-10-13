@@ -30,13 +30,15 @@ El `.ino` debe estar en una carpeta con su mismo nombre para el Arduino IDE.
 | 0 | llama + gas ≥ 1640 | vent 0/0/0, válvula cerrada, aspersor ON | inmediata |
 | 1 | gas ≥ 1640 (~20 % LEL), sin llama | vent 255/255/255, válvula cerrada | inmediata |
 | 2 | llama + T > 90 °C | vent 0, aspersor ON, válvula cerrada | inmediata |
-| 3 | llama + (T ≥ 60 °C o ΔT ≥ 2 °C/s) | solo extracción, aspersor, válvula | ΔT alto: inmediata; por T: 10 s |
+| 3 | llama + (T ≥ 60 °C o ΔT ≥ 2 °C/s o NTC averiado) | solo extracción, aspersor, válvula | ΔT alto o NTC averiado: inmediata; por T: 10 s |
 | 4 | gas 800–1640 (~10–20 % LEL) | ventilación 80–200 | inmediata |
 | 5 | presión ≥ 2786 y gas ≥ 800 | extracción máxima | inmediata |
 | 6 | presión ≥ 2786 | diferencial (V2 > V1) | inmediata |
 | 7 | T > 20 °C | PWM proporcional 80–255 | inmediata |
 | 8 | solo llama | monitoreo sin alarma | 10 s |
 | 9 | resto | normal | — |
+
+**Decisiones de diseño (usuario, 2026-10-12):** (a) si mientras P3 se confirma hay gas ≥ 800, la válvula se cierra y el buzzer suena de inmediato (aspersor y corte de inyección esperan la confirmación); (b) llama + NTC averiado se trata como P3 sin esperar.
 
 Mientras P3/P8 por temperatura se confirman, los actuadores siguen en "normal" pero el **MQTT ya publica la prioridad
 detectada** con `confirmando=true`. Umbrales gas/presión en cuentas ADC de 12 bits (0–4095), por calibrar con gas real.
@@ -52,14 +54,11 @@ WiFi se inicia sin bloquear; se reintenta cada 10 s. MQTT: un intento cada 10 s.
 
 ## Pruebas en PC
 ```bash
-cd test_host && ./run.sh        # compila el .ino real contra stubs de la API Arduino y ejecuta 18 escenarios
+cd test_host && ./run.sh        # compila el .ino real contra stubs de la API Arduino y ejecuta 20 escenarios
 ```
 Los stubs no modelan el ADC real, el PWM ni los tiempos de WiFi/TCP; los escenarios marcados `ABIERTO` son pendientes.
 
 ## Pendientes conocidos
-1. **Decisión de seguridad:** con llama, T ≥ 60 °C y gas ≥ 800, P3 espera 10 s y la válvula sigue abierta (los vent suben
-   por temperatura). Definir si P3 debe cerrar válvula sin esperar cuando hay gas.
-2. **Falla del NTC con llama:** `temperatura=0` solo permite P8; definir respuesta conservadora.
-3. `mqttClient.connect()` puede bloquear ~3 s por intento con broker caído; evaluar tarea FreeRTOS para la red.
-4. Compilar con el core ESP32 3.x y calibrar NTC (Steinhart-Hart, B=3950), MQ-2 (raw↔%LEL) y ruido de ΔT en hardware.
-5. `wokwi_diagram.json` es de Arduino Uno y no corresponde a este firmware.
+1. `mqttClient.connect()` puede bloquear ~3 s por intento con broker caído; evaluar tarea FreeRTOS para la red.
+2. Compilar con el core ESP32 3.x y calibrar NTC (Steinhart-Hart, B=3950), MQ-2 (raw↔%LEL) y ruido de ΔT en hardware.
+3. `wokwi_diagram.json` es de Arduino Uno y no corresponde a este firmware.
