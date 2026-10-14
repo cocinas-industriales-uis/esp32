@@ -67,6 +67,9 @@ int main(int argc,char**argv){
     const char*keys[]={"temperatura","gas_raw","gas_pct","presion_raw","presion_pct","llama","delta_t","prioridad","v1_pct","v2_pct","v3_pct","valvula","aspersor","confirmando","ts"}; bool all=true; for(auto k:keys) if(jget(g_pub.back(),k)==-12345) all=false;
     sprintf(buf,"P7: %zu msgs en 20 s ; P1: %zu msgs en 5 s",n7,n1); check("payload con las 15 claves del contrato",all);
     check("cadencia: P7~5 s (3-5 msgs/20s) y P1~0.5 s (>=9 msgs/5s)",n7>=3&&n7<=6&&n1>=9,buf); }
+  else if(t=="DUMP"){ // imprime los JSON publicados por el firmware real (fixture para mqtt/test_data)
+    struct C{double T;int gas,pres;bool ll;int ms;bool ntc;}; C cs[]={{25,100,500,false,6000,false},{25,1700,500,false,600,false},{25,1700,500,true,600,false},{70,100,500,true,3000,false},{95,100,500,true,600,false},{25,100,500,true,600,true},{200,100,500,true,600,false}};
+    for(auto&c:cs){ g_millis=0; g_pub.clear(); prioActual=9; prioConfirmando=-1; prioEnvioPrev=9; ultimoEnvio=0; ultimaLlamaTs=0; inputs(c.T,c.gas,c.pres,c.ll); if(c.ntc) g_analog[PIN_TEMP]=0; boot(); run(c.ms); if(!g_pub.empty()) printf("%s\n",g_pub.back().c_str()); } }
   else { printf("uso: t <escenario>\n"); return 2; }
   printf("  resumen: fallos=%d abiertos=%d\n",fails,opens); return fails?1:0;
 }
